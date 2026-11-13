@@ -1,0 +1,1479 @@
+---
+title: "Genetic variation underlying plasticity for physiological traits mediates response to climate in a Populus L. hybrid zone"
+author: "MEZP"
+date: "2024-11-19"
+output: html_document
+---
+```{r, setup}
+knitr::opts_knit$set(root.dir = '~/Article_Plasticity/Evolution/')
+
+```
+
+
+#open data frame
+```{r}
+#load libraries
+library(Hmisc)             # to create histogram of each variable
+library(dplyr)
+library(sjPlot)
+library(gridExtra)
+library(PerformanceAnalytics)
+library(MuMIn)
+library(lme4)
+library(ggplot2)
+library(purrr)
+library(ggpubr)
+library(performance)
+library(tidyr)
+
+
+df<-read.csv("Scripts and Data/Q1_GeneticVariation_Plasticity/Physiological_traits_2023.csv")
+
+colnames(df) <- c(
+  "ID", "PLANT_ID", "TAG", "Transect_SL", "Latitude",
+  "Longitude", "Elevation", "Code", "Unique_ID", "GARDEN", "BLOCK",
+  "ROW", "COLUMN", "mblock", "Dry_mass", "Area_m2", "LMA_g_m2",
+  "gsw", "PS2", "ETR", "Fs", "Fm", "GC_U",
+  "GC_L", "PL_U", "PL_L", "SD_upper", "SD_lower", "SDR",
+  "Ocurrence_upper", "d13C", "C", "d15N", "N", "CN",
+  "P_trichocarpa_ancestry", "Genotypic_class")
+
+##need this transformations for BLUPS and plasticity LMM
+df$log_Dry_mass<-log(df$Dry_mass)
+df$log_Area_m2<-log(df$Area_m2)
+df$log_gsw<-log(df$gsw)
+df$log_Fm<-log(df$Fm)
+
+metadata<-df %>% select(TAG, P_trichocarpa_ancestry, Genotypic_class, ID) %>% 
+  distinct()
+write.csv(metadata, "Scripts and Data/Q1_GeneticVariation_Plasticity/metadata.csv")
+```
+#Examine each quantitative variable#
+
+```{r}
+
+# Define traits to analyze
+traits <- c(
+  # Leaf Morphology
+  "Dry_mass",      # Leaf dry mass
+  "Area_m2",       # Leaf area
+  "LMA_g_m2",      # Leaf mass area
+  
+  # Gas exchange
+  "gsw",           # Stomatal conductance
+  
+  # Photochemistry
+  "PS2",           # Quantum efficiency in light (ΦPSII)
+  "ETR",           # Electron transport rate
+  "Fs",            # Minimum fluorescence in light
+  "Fm",            # Maximum fluorescence in light
+  
+  # Stomatal patterning
+  "PL_U",          # Adaxial density (Du)
+  "PL_L",          # Abaxial density (Dl)
+  "SD_upper",      # Adaxial stomatal density
+  "SD_lower",      # Abaxial stomatal density
+  "SDR",           # Stomata ratio
+  "Ocurrence_upper", # Adaxial stomatal occurrence  (Ou)
+  
+  # Gas exchange isotopes & Nutrient-use traits
+  "d13C",          # Carbon isotopes
+  "C",             # Carbon content
+  "d15N",          # Nitrogen isotopes
+  "N",             # Nitrogen content
+  "CN"             # Carbon:nitrogen ratio
+)
+
+
+# Set output PDF file for histograms
+pdf("Scripts and Data/Q1_GeneticVariation_Plasticity/Histogram_traits_2022.pdf", 
+    width = 18, height = 10)
+
+# Initialize list to store individual plots
+plot_list <- list()
+
+# Loop through each trait and generate histogram
+for (variable in traits) {
+  
+  p <- ggplot(df, aes(x = !!sym(variable), color = GARDEN)) +
+    geom_histogram(fill = "white", bins = 30) +  # You can adjust bins as needed
+    theme_classic() +
+    labs(x = variable, y = "Count") +
+    theme(
+      legend.position = "left",
+      axis.title = element_text(size = 12),
+      axis.text = element_text(size = 10)
+    )
+  
+  plot_list[[variable]] <- p
+}
+
+# Arrange plots in a grid and save to PDF
+grid.arrange(grobs = plot_list, ncol = 5)
+
+# Close the PDF device
+dev.off()
+
+```
+#Q1 To what extent do physiological traits exhibit genetic variation in plasticity across environments? 
+
+##Partition phenotypic variance into genotype, environment, and G×E
+```{r}
+
+set.seed(123)
+# FORMAT VARIABLES
+
+df$Genotype <- as.factor(df$PLANT_ID)
+df$Environment <- as.factor(df$GARDEN)
+df$mblock <- as.factor(df$mblock)
+
+
+# Binary trait analyzed separately
+traits_cont <- traits[traits != "Ocurrence_upper"]
+
+n_boot <- 1000 # Number of bootstrap replicates
+bootstrap_results <- list()
+
+
+# LOOP THROUGH CONTINUOUS TRAITS
+
+
+for (trait in traits_cont) {
+  
+  message("Analyzing trait: ", trait)
+  
+  # Prepare trait-specific dataset
+
+  df_sub <- df %>%
+    filter(
+      !is.na(.data[[trait]]),
+      !is.na(Genotype),
+      !is.na(Environment),
+      !is.na(mblock)
+    )
+  
+  if (nrow(df_sub) < 10) next
+  
+  # Get unique genotypes
+
+  genotypes <- unique(df_sub$Genotype)
+  n_genotypes <- length(genotypes)
+  
+  trait_boot <- list()
+  
+
+  # BOOTSTRAP LOOP
+
+  for (b in 1:n_boot) {
+    
+    if (b %% 100 == 0) {
+      message("  Bootstrap ", b, " / ", n_boot)
+    }
+    
+
+    # Sample genotypes with replacement
+
+    sampled_genotypes <- sample(
+      genotypes,
+      size = n_genotypes,
+      replace = TRUE
+    )
+    
+
+    # Build bootstrap dataset
+
+    boot_dat_list <- list()
+    
+    for (j in seq_along(sampled_genotypes)) {
+      
+      g <- sampled_genotypes[j]
+      
+      temp <- df_sub[df_sub$Genotype == g, ]
+      
+      # Give each bootstrap draw a unique genotype ID
+      temp$Genotype_boot <- paste0("boot_", j)
+      
+      boot_dat_list[[j]] <- temp
+    }
+    
+    boot_dat <- bind_rows(boot_dat_list)
+    
+    boot_dat$Genotype_boot <- factor(boot_dat$Genotype_boot)
+    boot_dat$Environment <- factor(boot_dat$Environment)
+    boot_dat$mblock <- factor(boot_dat$mblock)
+    
+
+    # Fit bootstrap model
+
+    
+    formula_boot <- as.formula(
+      paste0(
+        trait,
+        " ~ 1 + ",
+        "(1|Genotype_boot) + ",
+        "(1|Environment) + ",
+        "(1|Genotype_boot:Environment) + ",
+        "(1|mblock)"
+      )
+    )
+    
+    model_boot <- tryCatch(
+      lmer(
+        formula_boot,
+        data = boot_dat,
+        REML = TRUE,
+        control = lmerControl(
+          optimizer = "bobyqa",
+          optCtrl = list(maxfun = 2e5)
+        )
+      ),
+      error = function(e) NULL
+    )
+    
+    if (is.null(model_boot)) next
+    
+
+    # Extract variance components
+
+    vc_boot <- as.data.frame(VarCorr(model_boot))
+    
+    boot_genotype <- vc_boot$vcov[
+      vc_boot$grp == "Genotype_boot"
+    ]
+    
+    boot_environment <- vc_boot$vcov[
+      vc_boot$grp == "Environment"
+    ]
+    
+    boot_gxe <- vc_boot$vcov[
+      vc_boot$grp == "Genotype_boot:Environment"
+    ]
+    
+    boot_block <- vc_boot$vcov[
+      vc_boot$grp == "mblock"
+    ]
+    
+    boot_residual <- vc_boot$vcov[
+      vc_boot$grp == "Residual"
+    ]
+    
+    # Skip bootstrap replicate if component is missing
+    if (
+      length(boot_genotype) == 0 ||
+      length(boot_environment) == 0 ||
+      length(boot_gxe) == 0 ||
+      length(boot_block) == 0 ||
+      length(boot_residual) == 0
+    ) {
+      next
+    }
+    
+
+    # Total variance
+
+    boot_total <- (
+      boot_genotype +
+      boot_environment +
+      boot_gxe +
+      boot_block +
+      boot_residual
+    )
+    
+    # Save bootstrap replicate
+
+    trait_boot[[b]] <- data.frame(
+      Trait = trait,
+      Bootstrap = b,
+      
+      Genotype_vcov = boot_genotype,
+      Environment_vcov = boot_environment,
+      GxE_vcov = boot_gxe,
+      block_vcov = boot_block,
+      Residual_vcov = boot_residual,
+      
+      Genotype_prop = boot_genotype / boot_total * 100,
+      Environment_prop = boot_environment / boot_total * 100,
+      GxE_prop = boot_gxe / boot_total * 100,
+      block_prop = boot_block / boot_total * 100,
+      Residual_prop = boot_residual / boot_total * 100
+    )
+  }
+  
+  bootstrap_results[[trait]] <- bind_rows(trait_boot)
+}
+
+
+# COMBINE ALL BOOTSTRAP RESULTS
+
+bootstrap_results_df <- bind_rows(bootstrap_results)
+
+# BOOTSTRAP MEANS + 95% CONFIDENCE INTERVALS
+
+final_results <- bootstrap_results_df %>%
+  group_by(Trait) %>%
+  summarise(
+    
+    Genotype_mean = mean(Genotype_prop, na.rm = TRUE),
+    Genotype_lower = quantile(Genotype_prop, 0.025, na.rm = TRUE),
+    Genotype_upper = quantile(Genotype_prop, 0.975, na.rm = TRUE),
+    
+    Environment_mean = mean(Environment_prop, na.rm = TRUE),
+    Environment_lower = quantile(Environment_prop, 0.025, na.rm = TRUE),
+    Environment_upper = quantile(Environment_prop, 0.975, na.rm = TRUE),
+    
+    GxE_mean = mean(GxE_prop, na.rm = TRUE),
+    GxE_lower = quantile(GxE_prop, 0.025, na.rm = TRUE),
+    GxE_upper = quantile(GxE_prop, 0.975, na.rm = TRUE),
+    
+    block_mean = mean(block_prop, na.rm = TRUE),
+    block_lower = quantile(block_prop, 0.025, na.rm = TRUE),
+    block_upper = quantile(block_prop, 0.975, na.rm = TRUE),
+    
+    Residual_mean = mean(Residual_prop, na.rm = TRUE),
+    Residual_lower = quantile(Residual_prop, 0.025, na.rm = TRUE),
+    Residual_upper = quantile(Residual_prop, 0.975, na.rm = TRUE),
+    
+    n_successful_boot = n(),
+    
+    .groups = "drop"
+  ) %>%
+  mutate(
+    across(
+      where(is.numeric),
+      ~ round(.x, 2)
+    )
+  )
+
+# VIEW RESULTS
+print(final_results)
+#write.csv(final_results, "final_results.csv")
+```
+
+```{r}
+# BOOTSTRAP VARIANCE PARTITIONING FOR OCCURRENCE_UPPER
+
+set.seed(123)
+
+n_boot <- 1000
+
+
+# Prepare data
+
+df_occur <- df %>%
+  filter(
+    !is.na(Ocurrence_upper),
+    !is.na(Genotype),
+    !is.na(Environment),
+    !is.na(mblock)
+  )
+
+df_occur$Genotype <- factor(df_occur$Genotype)
+df_occur$Environment <- factor(df_occur$Environment)
+df_occur$mblock <- factor(df_occur$mblock)
+
+# Unique genotypes
+genotypes <- unique(df_occur$Genotype)
+n_genotypes <- length(genotypes)
+
+# Empty list
+occur_boot <- list()
+
+
+# Bootstrap
+
+for (b in 1:n_boot) {
+  
+  if (b %% 100 == 0) {
+    message("Bootstrap ", b, " / ", n_boot)
+  }
+  
+  # Sample genotypes with replacement
+  sampled_genotypes <- sample(
+    genotypes,
+    size = n_genotypes,
+    replace = TRUE
+  )
+  
+  # Build bootstrap dataset
+  boot_dat_list <- list()
+  
+  for (j in seq_along(sampled_genotypes)) {
+    
+    g <- sampled_genotypes[j]
+    
+    temp <- df_occur[df_occur$Genotype == g, ]
+    
+    # Unique ID for each bootstrap draw
+    temp$Genotype_boot <- paste0("boot_", j)
+    
+    boot_dat_list[[j]] <- temp
+  }
+  
+  boot_dat <- bind_rows(boot_dat_list)
+  
+  boot_dat$Genotype_boot <- factor(boot_dat$Genotype_boot)
+  boot_dat$Environment <- factor(boot_dat$Environment)
+  boot_dat$mblock <- factor(boot_dat$mblock)
+  
+
+  # Fit binomial GLMM
+  model_boot <- tryCatch(
+    
+    glmer(
+      Ocurrence_upper ~
+        1 +
+        (1 | Genotype_boot) +
+        (1 | Environment) +
+        (1 | Genotype_boot:Environment) +
+        (1 | mblock),
+      
+      data = boot_dat,
+      family = binomial,
+      
+      control = glmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(maxfun = 2e5)
+      )
+    ),
+    
+    error = function(e) NULL
+  )
+  
+  if (is.null(model_boot)) next
+  
+  # Extract variance components
+
+  vc_boot <- as.data.frame(VarCorr(model_boot))
+  
+  var_genotype <- vc_boot$vcov[
+    vc_boot$grp == "Genotype_boot"
+  ]
+  
+  var_environment <- vc_boot$vcov[
+    vc_boot$grp == "Environment"
+  ]
+  
+  var_gxe <- vc_boot$vcov[
+    vc_boot$grp == "Genotype_boot:Environment"
+  ]
+  
+  var_block <- vc_boot$vcov[
+    vc_boot$grp == "mblock"
+  ]
+  
+  # Skip failed replicate
+  if (
+    length(var_genotype) == 0 ||
+    length(var_environment) == 0 ||
+    length(var_gxe) == 0 ||
+    length(var_block) == 0
+  ) {
+    next
+  }
+  
+  # Residual variance for binomial-logit model
+
+  var_residual <- (pi^2) / 3
+  
+  # Total variance
+  total_var <- (
+    var_genotype +
+    var_environment +
+    var_gxe +
+    var_block +
+    var_residual
+  )
+  
+
+  # Save each bootstrap replicate
+  occur_boot[[b]] <- data.frame(
+    
+    Trait = "Ocurrence_upper",
+    Bootstrap = b,
+    
+    Genotype_prop = var_genotype / total_var * 100,
+    Environment_prop = var_environment / total_var * 100,
+    GxE_prop = var_gxe / total_var * 100,
+    block_prop = var_block / total_var * 100,
+    Residual_prop = var_residual / total_var * 100
+  )
+}
+
+# Combine bootstrap replicates
+
+occur_boot_df <- bind_rows(occur_boot)
+
+# Bootstrap mean + 95% CI
+
+occur_final <- occur_boot_df %>%
+  summarise(
+    
+    Genotype_mean = mean(Genotype_prop, na.rm = TRUE),
+    Genotype_lower = quantile(Genotype_prop, 0.025, na.rm = TRUE),
+    Genotype_upper = quantile(Genotype_prop, 0.975, na.rm = TRUE),
+    
+    Environment_mean = mean(Environment_prop, na.rm = TRUE),
+    Environment_lower = quantile(Environment_prop, 0.025, na.rm = TRUE),
+    Environment_upper = quantile(Environment_prop, 0.975, na.rm = TRUE),
+    
+    GxE_mean = mean(GxE_prop, na.rm = TRUE),
+    GxE_lower = quantile(GxE_prop, 0.025, na.rm = TRUE),
+    GxE_upper = quantile(GxE_prop, 0.975, na.rm = TRUE),
+    
+    block_mean = mean(block_prop, na.rm = TRUE),
+    block_lower = quantile(block_prop, 0.025, na.rm = TRUE),
+    block_upper = quantile(block_prop, 0.975, na.rm = TRUE),
+    
+    Residual_mean = mean(Residual_prop, na.rm = TRUE),
+    Residual_lower = quantile(Residual_prop, 0.025, na.rm = TRUE),
+    Residual_upper = quantile(Residual_prop, 0.975, na.rm = TRUE),
+    
+    n_successful_boot = n()
+    
+  ) %>%
+  mutate(
+    Trait = "Ocurrence_upper",
+    .before = 1
+  )
+
+# Round
+occur_final <- occur_final %>%
+  mutate(
+    across(where(is.numeric), ~ round(.x, 3))
+  )
+
+print(occur_final)
+
+```
+
+```{r}
+
+# combine results for continuous traits + binary
+
+var_part_df <- bind_rows(final_results, occur_final)
+
+
+#Format table for publishing
+var_part_table <- var_part_df %>%
+  mutate(
+    Trait = factor(Trait, levels = traits),
+    
+    Genotype = paste0(
+      round(Genotype_mean, 2), " (",
+      round(Genotype_lower, 2), "–",
+      round(Genotype_upper, 2), ")"
+    ),
+    
+    Environment = paste0(
+      round(Environment_mean, 2), " (",
+      round(Environment_lower, 2), "–",
+      round(Environment_upper, 2), ")"
+    ),
+    
+    `G × E` = paste0(
+      round(GxE_mean, 2), " (",
+      round(GxE_lower, 2), "–",
+      round(GxE_upper, 2), ")"
+    ),
+    
+    Block = paste0(
+      round(block_mean, 2), " (",
+      round(block_lower, 2), "–",
+      round(block_upper, 2), ")"
+    ),
+    
+    Residual = paste0(
+      round(Residual_mean, 2), " (",
+      round(Residual_lower, 2), "–",
+      round(Residual_upper, 2), ")"
+    )
+  ) %>%
+  arrange(Trait) %>%
+  select(
+    Trait,
+    Genotype,
+    Environment,
+    `G × E`,
+    Block,
+    Residual
+  )
+
+print(var_part_table)
+
+
+write.csv(var_part_table, "Scripts and Data/Q1_GeneticVariation_Plasticity/partitioning_variance_values.csv")
+
+
+```
+
+
+##Plot variance partioning 
+```{r}
+
+
+# Define trait order
+
+trait_order <- c(
+  "N", "CN", "d15N", "C",
+  "Ocurrence_upper", "SDR", "SD_lower", "SD_upper",
+  "PL_L", "PL_U",
+  "Fm", "Fs", "ETR", "PS2",
+  "d13C", "gsw",
+  "LMA_g_m2", "Area_m2", "Dry_mass"
+)
+
+
+# Define source order
+
+
+source_order <- c(
+  "Residual",
+  "block",
+  "GxE",
+  "Environment",
+  "Genotype"
+)
+
+
+# Trait labels
+
+
+trait_labels <- c(
+  "Dry_mass"        = "Leaf dry mass",
+  "Area_m2"         = "Leaf area",
+  "LMA_g_m2"        = "Leaf mass area",
+  "gsw"             = "Stomatal conductance",
+  "d13C"            = "Water-use efficiency",
+  "PS2"             = "Quantum efficiency in light",
+  "ETR"             = "Electron transport rate",
+  "Fs"              = "Minimum fluorescence",
+  "Fm"              = "Maximum fluorescence",
+  "PL_U"            = "Adaxial pore length",
+  "PL_L"            = "Abaxial pore length",
+  "SD_upper"        = "Adaxial stomatal density",
+  "SD_lower"        = "Abaxial stomatal density",
+  "SDR"             = "Stomatal ratio",
+  "Ocurrence_upper" = "Adaxial stomatal occurrence",
+  "C"               = "Carbon content",
+  "N"               = "Nitrogen content",
+  "CN"              = "Carbon:Nitrogen ratio",
+  "d15N"            = "Nitrogen isotopes"
+)
+
+
+# Category mapping
+
+
+category_map <- c(
+  "Dry_mass"        = "Leaf\nmorphology",
+  "Area_m2"         = "Leaf\nmorphology",
+  "LMA_g_m2"        = "Leaf\nmorphology",
+  "gsw"             = "Gas\nexchange",
+  "d13C"            = "Gas\nexchange",
+  "PS2"             = "Photochemistry",
+  "ETR"             = "Photochemistry",
+  "Fs"              = "Photochemistry",
+  "Fm"              = "Photochemistry",
+  "PL_U"            = "Stomatal\npatterning",
+  "PL_L"            = "Stomatal\npatterning",
+  "SD_upper"        = "Stomatal\npatterning",
+  "SD_lower"        = "Stomatal\npatterning",
+  "SDR"             = "Stomatal\npatterning",
+  "Ocurrence_upper" = "Stomatal\npatterning",
+  "C"               = "Nutrient\nuse",
+  "N"               = "Nutrient\nuse",
+  "CN"              = "Nutrient\nuse",
+  "d15N"            = "Nutrient\nuse"
+)
+
+category_order <- c(
+  "Leaf\nmorphology",
+  "Gas\nexchange",
+  "Photochemistry",
+  "Stomatal\npatterning",
+  "Nutrient\nuse"
+)
+
+
+# Fill settings
+
+
+fill_values <- c(
+  "Genotype"    = "#51127c",
+  "Environment" = "#b73779",
+  "GxE"         = "orange3",
+  "block"       = "pink3",
+  "Residual"    = "#D3D3D3"
+)
+
+fill_labels <- c(
+  "Genotype"    = "Genotype (G)",
+  "Environment" = "Environment (E)",
+  "GxE"         = "Genotype × Environment (G × E)",
+  "block"       = "Block effect",
+  "Residual"    = "Residual"
+)
+
+legend_order <- c(
+  "Genotype",
+  "Environment",
+  "GxE",
+  "block",
+  "Residual"
+)
+
+
+# Convert bootstrap results to long format
+
+
+plot_df <- var_part_df %>%
+  
+  select(
+    Trait,
+    Genotype_mean,
+    Environment_mean,
+    GxE_mean,
+    block_mean,
+    Residual_mean
+  ) %>%
+  
+  pivot_longer(
+    cols = -Trait,
+    names_to = "Source",
+    values_to = "Proportion"
+  ) %>%
+  
+  mutate(
+    
+    # Remove "_mean" from source names
+    Source = sub("_mean$", "", Source),
+    
+    Trait = factor(
+      Trait,
+      levels = trait_order
+    ),
+    
+    Source = factor(
+      Source,
+      levels = source_order
+    ),
+    
+    Category = recode(
+      as.character(Trait),
+      !!!category_map
+    ),
+    
+    Category = factor(
+      Category,
+      levels = category_order
+    )
+  )
+
+
+# Plot
+
+
+p <- ggplot(
+  plot_df,
+  aes(
+    x = Trait,
+    y = Proportion,
+    fill = Source
+  )
+) +
+  
+  geom_col() +
+  
+  scale_x_discrete(
+    labels = trait_labels
+  ) +
+  
+  scale_fill_manual(
+    breaks = legend_order,
+    values = fill_values,
+    labels = fill_labels,
+    name = "Source of Variation"
+  ) +
+  
+  facet_grid(
+    Category ~ .,
+    scales = "free_y",
+    space = "free_y"
+  ) +
+  
+  coord_flip() +
+  
+  labs(
+    x = "",
+    y = "Proportion of Variance Explained (%)"
+  ) +
+  
+  theme_bw() +
+  
+  theme(
+    axis.text.x = element_text(
+      color = "black",
+      size = 12
+    ),
+    axis.text.y = element_text(
+      color = "black",
+      size = 12
+    ),
+    axis.title.x = element_text(size = 16),
+    axis.title.y = element_text(size = 16),
+    strip.background = element_rect(fill = "gray90"),
+    strip.text = element_text(
+      color = "black",
+      size = 10
+    ),
+    panel.grid = element_blank()
+  )
+
+p
+
+ggsave(
+  filename = "Scripts and Data/Q1_GeneticVariation_Plasticity/partitioning_variance_values_article.pdf",
+  plot = p,
+  height = 9,
+  width = 13
+)
+
+```
+#AIC-based model comparison for G × E effects 
+```{r}
+traits3 <- c(
+  "Dry_mass", "Area_m2", "LMA_g_m2", "gsw",
+  "PS2", "ETR", "Fs", "Fm",
+  "PL_U", "PL_L", "SD_upper", "SD_lower", "SDR", 
+  "Ocurrence_upper",
+  "d13C", "C", "d15N", "N", "CN"
+)
+
+models_list <- list()
+AIC_results <- list()
+
+for (trait in traits3) {
+  
+  message("Fitting models for trait: ", trait)
+  
+  df_sub <- df[!is.na(df[[trait]]), ]
+  
+  if (nrow(df_sub) < 10) next
+  
+  
+  # Full model: includes G x E
+  full_formula <- as.formula(
+    paste0(
+      trait,
+      " ~ 1 + (1|ID) + (1|GARDEN) + ",
+      "(1|ID:GARDEN) + (1|mblock)"
+    )
+  )
+  
+  # Reduced model: removes G x E
+  null_formula <- as.formula(
+    paste0(
+      trait,
+      " ~ 1 + (1|ID) + (1|GARDEN) + (1|mblock)"
+    )
+  )
+  
+  
+  # ----------------------------------------------------------
+  # Binary trait
+  # ----------------------------------------------------------
+  
+  if (trait == "Ocurrence_upper") {
+    
+    full_model <- tryCatch(
+      glmer(
+        full_formula,
+        data = df_sub,
+        family = binomial
+      ),
+      error = function(e) {
+        message("FULL MODEL ERROR: ", e$message)
+        NULL
+      }
+    )
+    
+    null_model <- tryCatch(
+      glmer(
+        null_formula,
+        data = df_sub,
+        family = binomial
+      ),
+      error = function(e) {
+        message("REDUCED MODEL ERROR: ", e$message)
+        NULL
+      }
+    )
+    
+    
+  # ----------------------------------------------------------
+  # Continuous traits
+  # ----------------------------------------------------------
+    
+  } else {
+    
+    full_model <- tryCatch(
+      lmer(
+        full_formula,
+        data = df_sub,
+        REML = TRUE
+      ),
+      error = function(e) {
+        message("FULL MODEL ERROR: ", e$message)
+        NULL
+      }
+    )
+    
+    null_model <- tryCatch(
+      lmer(
+        null_formula,
+        data = df_sub,
+        REML = TRUE
+      ),
+      error = function(e) {
+        message("REDUCED MODEL ERROR: ", e$message)
+        NULL
+      }
+    )
+  }
+  
+  
+  if (is.null(full_model) || is.null(null_model)) next
+  
+  
+  # Store models
+  models_list[[trait]] <- list(
+    full = full_model,
+    null = null_model,
+    N = nrow(df_sub)
+  )
+  
+  
+  # ----------------------------------------------------------
+  # Compare AIC
+  # ----------------------------------------------------------
+  
+  AIC_full <- AIC(full_model)
+  AIC_reduced <- AIC(null_model)
+  
+  # Positive Delta AIC means full GxE model is better
+  delta_AIC <- AIC_reduced - AIC_full
+  
+  
+  AIC_results[[trait]] <- data.frame(
+    Trait = trait,
+    N = nrow(df_sub),
+    AIC_full = AIC_full,
+    AIC_reduced = AIC_reduced,
+    Delta_AIC = delta_AIC,
+    GxE_supported = delta_AIC >= 2
+  )
+}
+
+
+# ------------------------------------------------------------
+# Combine results
+# ------------------------------------------------------------
+
+AIC_results_df <- do.call(rbind, AIC_results)
+
+rownames(AIC_results_df) <- NULL
+
+AIC_results_df
+
+
+
+sig_traits_GxE <- AIC_results_df$Trait[
+  AIC_results_df$Delta_AIC >= 2
+]
+
+sig_traits_GxE
+
+```
+
+
+##Q1.1 Estimating broad sense heritability for physiological traits
+###Vermont 
+
+```{r}
+
+
+df_Vermont <- df %>%
+  filter(GARDEN == "Vermont")
+
+traits <- c(
+  "Dry_mass", "Area_m2", "LMA_g_m2", "gsw", "d13C",
+  "PS2", "ETR", "Fs", "Fm",
+  "GC_U", "GC_L", "PL_U", "PL_L",
+  "SD_upper", "SD_lower", "SDR", "Ocurrence_upper",
+  "C", "d15N", "N", "CN"
+)
+
+# Number of bootstrap replicates
+n_boot <- 1000
+
+set.seed(123)
+
+bootstrap_results_Vermont <- data.frame()
+
+for (trait in traits) {
+
+  cat("Bootstrapping:", trait, "\n")
+
+  # Remove missing values for this trait
+  dat_trait <- df_Vermont %>%
+    filter(
+      !is.na(.data[[trait]]),
+      !is.na(PLANT_ID),
+      !is.na(BLOCK)
+    )
+
+  # Unique genotypes
+  genotypes <- unique(dat_trait$PLANT_ID)
+
+  boot_H2 <- rep(NA, n_boot)
+
+  for (b in 1:n_boot) {
+
+    # ---------------------------------------------------------
+    # Bootstrap PLANT_IDs WITH REPLACEMENT
+    # ---------------------------------------------------------
+    sampled_ids <- sample(
+      genotypes,
+      size = length(genotypes),
+      replace = TRUE
+    )
+
+    # Important:
+    # duplicated genotypes need NEW genotype IDs in bootstrap
+    boot_dat <- bind_rows(
+      lapply(seq_along(sampled_ids), function(i) {
+
+        tmp <- dat_trait %>%
+          filter(PLANT_ID == sampled_ids[i])
+
+        # Treat repeated draws of same genotype as separate
+        # bootstrap clusters
+        tmp$BOOT_ID <- paste0("G", i)
+
+        tmp
+      })
+    )
+
+    # ---------------------------------------------------------
+    # Continuous traits
+    # ---------------------------------------------------------
+    if (trait != "Ocurrence_upper") {
+
+      form <- as.formula(
+        paste(trait, "~ (1|BOOT_ID) + (1|BLOCK)")
+      )
+
+      model <- try(
+        lmer(
+          form,
+          data = boot_dat,
+          REML = TRUE
+        ),
+        silent = TRUE
+      )
+
+      if (!inherits(model, "try-error")) {
+
+        vc <- as.data.frame(VarCorr(model))
+
+        sigma_g <- vc$vcov[vc$grp == "BOOT_ID"]
+        sigma_b <- vc$vcov[vc$grp == "BLOCK"]
+        sigma_e <- vc$vcov[vc$grp == "Residual"]
+
+        if (
+          length(sigma_g) == 1 &&
+          length(sigma_b) == 1 &&
+          length(sigma_e) == 1
+        ) {
+
+          boot_H2[b] <-
+            sigma_g /
+            (sigma_g + sigma_b + sigma_e)
+        }
+      }
+    }
+
+    # ---------------------------------------------------------
+    # Binary occurrence trait
+    # ---------------------------------------------------------
+    if (trait == "Ocurrence_upper") {
+
+      model <- try(
+        glmer(
+          Ocurrence_upper ~
+            (1 | BOOT_ID) +
+            (1 | BLOCK),
+          data = boot_dat,
+          family = binomial,
+          control = glmerControl(
+            optimizer = "bobyqa",
+            optCtrl = list(maxfun = 100000)
+          )
+        ),
+        silent = TRUE
+      )
+
+      if (!inherits(model, "try-error")) {
+
+        vc <- as.data.frame(VarCorr(model))
+
+        sigma_g <- vc$vcov[vc$grp == "BOOT_ID"]
+        sigma_b <- vc$vcov[vc$grp == "BLOCK"]
+
+        # Latent-scale residual variance
+        sigma_e <- pi^2 / 3
+
+        if (
+          length(sigma_g) == 1 &&
+          length(sigma_b) == 1
+        ) {
+
+          boot_H2[b] <-
+            sigma_g /
+            (sigma_g + sigma_b + sigma_e)
+        }
+      }
+    }
+  }
+
+  # ---------------------------------------------------------
+  # Summarize bootstrap distribution
+  # ---------------------------------------------------------
+
+  boot_H2_clean <- boot_H2[is.finite(boot_H2)]
+
+  bootstrap_results_Vermont <- bind_rows(
+    bootstrap_results_Vermont,
+    data.frame(
+      Trait = trait,
+      H2_boot_mean = mean(boot_H2_clean),
+      H2_boot_median = median(boot_H2_clean),
+      CI_lower = quantile(
+        boot_H2_clean,
+        0.025
+      ),
+      CI_upper = quantile(
+        boot_H2_clean,
+        0.975
+      ),
+      N_success = length(boot_H2_clean),
+      Garden = "Vermont"
+    )
+  )
+}
+
+bootstrap_results_Vermont
+
+
+```
+
+###Virginia 
+```{r}
+library(dplyr)
+library(lme4)
+
+df_Virginia <- df %>%
+  filter(GARDEN == "Virginia")
+
+traits <- c(
+  "Dry_mass", "Area_m2", "LMA_g_m2", "gsw", "d13C",
+  "PS2", "ETR", "Fs", "Fm",
+  "GC_U", "GC_L", "PL_U", "PL_L",
+  "SD_upper", "SD_lower", "SDR", "Ocurrence_upper",
+  "C", "d15N", "N", "CN"
+)
+
+# Number of bootstrap replicates
+n_boot <- 1000
+
+set.seed(123)
+
+bootstrap_results_Virginia <- data.frame()
+
+for (trait in traits) {
+
+  cat("Bootstrapping:", trait, "\n")
+
+  # Remove missing values for this trait
+  dat_trait <- df_Virginia %>%
+    filter(
+      !is.na(.data[[trait]]),
+      !is.na(PLANT_ID),
+      !is.na(BLOCK)
+    )
+
+  # Unique genotypes
+  genotypes <- unique(dat_trait$PLANT_ID)
+
+  boot_H2 <- rep(NA, n_boot)
+
+  for (b in 1:n_boot) {
+
+    # ---------------------------------------------------------
+    # Bootstrap PLANT_IDs WITH REPLACEMENT
+    # ---------------------------------------------------------
+    sampled_ids <- sample(
+      genotypes,
+      size = length(genotypes),
+      replace = TRUE
+    )
+
+    # Important:
+    # duplicated genotypes need NEW genotype IDs in bootstrap
+    boot_dat <- bind_rows(
+      lapply(seq_along(sampled_ids), function(i) {
+
+        tmp <- dat_trait %>%
+          filter(PLANT_ID == sampled_ids[i])
+
+        # Treat repeated draws of same genotype as separate
+        # bootstrap clusters
+        tmp$BOOT_ID <- paste0("G", i)
+
+        tmp
+      })
+    )
+
+    # ---------------------------------------------------------
+    # Continuous traits
+    # ---------------------------------------------------------
+    if (trait != "Ocurrence_upper") {
+
+      form <- as.formula(
+        paste(trait, "~ (1|BOOT_ID) + (1|BLOCK)")
+      )
+
+      model <- try(
+        lmer(
+          form,
+          data = boot_dat,
+          REML = TRUE
+        ),
+        silent = TRUE
+      )
+
+      if (!inherits(model, "try-error")) {
+
+        vc <- as.data.frame(VarCorr(model))
+
+        sigma_g <- vc$vcov[vc$grp == "BOOT_ID"]
+        sigma_b <- vc$vcov[vc$grp == "BLOCK"]
+        sigma_e <- vc$vcov[vc$grp == "Residual"]
+
+        if (
+          length(sigma_g) == 1 &&
+          length(sigma_b) == 1 &&
+          length(sigma_e) == 1
+        ) {
+
+          boot_H2[b] <-
+            sigma_g /
+            (sigma_g + sigma_b + sigma_e)
+        }
+      }
+    }
+
+    # ---------------------------------------------------------
+    # Binary occurrence trait
+    # ---------------------------------------------------------
+    if (trait == "Ocurrence_upper") {
+
+      model <- try(
+        glmer(
+          Ocurrence_upper ~
+            (1 | BOOT_ID) +
+            (1 | BLOCK),
+          data = boot_dat,
+          family = binomial,
+          control = glmerControl(
+            optimizer = "bobyqa",
+            optCtrl = list(maxfun = 100000)
+          )
+        ),
+        silent = TRUE
+      )
+
+      if (!inherits(model, "try-error")) {
+
+        vc <- as.data.frame(VarCorr(model))
+
+        sigma_g <- vc$vcov[vc$grp == "BOOT_ID"]
+        sigma_b <- vc$vcov[vc$grp == "BLOCK"]
+
+        # Latent-scale residual variance
+        sigma_e <- pi^2 / 3
+
+        if (
+          length(sigma_g) == 1 &&
+          length(sigma_b) == 1
+        ) {
+
+          boot_H2[b] <-
+            sigma_g /
+            (sigma_g + sigma_b + sigma_e)
+        }
+      }
+    }
+  }
+
+  # ---------------------------------------------------------
+  # Summarize bootstrap distribution
+  # ---------------------------------------------------------
+
+  boot_H2_clean <- boot_H2[is.finite(boot_H2)]
+
+  bootstrap_results_Virginia <- bind_rows(
+    bootstrap_results_Virginia,
+    data.frame(
+      Trait = trait,
+      H2_boot_mean = mean(boot_H2_clean),
+      H2_boot_median = median(boot_H2_clean),
+      CI_lower = quantile(
+        boot_H2_clean,
+        0.025
+      ),
+      CI_upper = quantile(
+        boot_H2_clean,
+        0.975
+      ),
+      N_success = length(boot_H2_clean),
+      Garden = "Virginia"
+    )
+  )
+}
+
+bootstrap_results_Virginia
+```
+###H2 data frame  
+
+```{r}
+
+h2<-data.frame(trait=bootstrap_results_Vermont$Trait, 
+               Vermont_mean= bootstrap_results_Vermont$H2_boot_mean,
+               Vermont_CI_lower= bootstrap_results_Vermont$CI_lower,
+               Vermont_CI_upper= bootstrap_results_Vermont$CI_upper,
+               Virginia_mean= bootstrap_results_Virginia$H2_boot_mean,
+               Virginia_CI_lower= bootstrap_results_Virginia$CI_lower,
+               Virginia_CI_upper= bootstrap_results_Virginia$CI_upper
+               )
+
+print(h2)
+
+write.csv(h2,"R1/Heritability.csv")
+
+```
+
+```{r}
+h2<-read.csv("Scripts and Data/Q1_GeneticVariation_Plasticity/Heritability.csv")
+
+
+h2_table <- h2 %>%
+  mutate(
+    
+    # Same trait order as variance partitioning
+    Trait = factor(trait, levels = traits),
+    
+    `H² Vermont` = paste0(
+      round(Vermont_mean, 2),
+      " (",
+      round(Vermont_CI_lower, 2),
+      "–",
+      round(Vermont_CI_upper, 2),
+      ")"
+    ),
+    
+    `H² Virginia` = paste0(
+      round(Virginia_mean, 2),
+      " (",
+      round(Virginia_CI_lower, 2),
+      "–",
+      round(Virginia_CI_upper, 2),
+      ")"
+    )
+  ) %>%
+  
+  arrange(Trait) %>%
+  
+  select(
+    Trait,
+    `H² Vermont`,
+    `H² Virginia`
+  )
+
+h2_table
+colnames(h2_table)[1]<-"Trait"
+```
+
+#Merge results from variance partitioning and h2
+
+```{r}
+df_article <- merge(
+  var_part_table,
+  h2_table,
+  by = "Trait",
+  all.x = TRUE,
+  sort = FALSE
+)
+
+# Force exactly the same order as var_part_table
+df_article <- df_article[
+  match(var_part_table$Trait, df_article$Trait),
+]
+
+write.csv(
+  df_article,
+  "Scripts and Data/Q1_GeneticVariation_Plasticity/Var_part_h2_article_table.csv",
+  row.names = FALSE
+)
+
+
+
+var_part_means <- final_results %>%
+  mutate(
+    Trait = factor(Trait, levels = traits)
+  ) %>%
+  arrange(Trait) %>%
+  select(
+    Trait,
+    Genotype = Genotype_mean,
+    Environment = Environment_mean,
+    `G × E` = GxE_mean,
+    Block = block_mean,
+    Residual = Residual_mean
+  )
+
+h2_means <- h2 %>%
+  mutate(
+    Trait = factor(trait, levels = traits)
+  ) %>%
+  arrange(trait) %>%
+  select(
+    Trait,
+    `H² Vermont` = Vermont_mean,
+    `H² Virginia` = Virginia_mean
+  )
+
+df_article_means <- var_part_means %>%
+  left_join(h2_means, by = "Trait")
+
+write.csv(
+  df_article_means,
+  "Scripts and Data/Q1_GeneticVariation_Plasticity/Var_part_h2_article_table_means.csv",
+  row.names = FALSE
+)
+
+```
+
+
+
+

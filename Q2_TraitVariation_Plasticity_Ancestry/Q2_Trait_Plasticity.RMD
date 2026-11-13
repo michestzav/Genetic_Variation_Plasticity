@@ -1,0 +1,1827 @@
+---
+title: "Genetic variation underlying plasticity for physiological traits mediates response to climate in a Populus L. hybrid zone"
+author: "MEZP"
+date: "2024-11-19"
+output: html_document
+---
+```{r, setup}
+knitr::opts_knit$set(root.dir = "~/Article_Plasticity/Evolution")
+
+```
+
+
+#open data frame
+```{r}
+
+# Load libraries
+library(Hmisc)                # Histograms and descriptive analyses
+library(dplyr)
+library(sjPlot)
+library(gridExtra)
+library(PerformanceAnalytics)
+library(MuMIn)
+library(lme4)
+library(ggplot2)
+library(purrr)
+library(ggpubr)
+library(performance)
+library(tidyr)
+library(tibble)
+
+df<-read.csv("Scripts and Data/Q1_GeneticVariation_Plasticity/Physiological_traits_2023.csv")
+
+  
+colnames(df) <- c(
+  "ID", "PLANT_ID", "TAG", "Transect_SL", "Latitude",
+  "Longitude", "Elevation", "Code", "Unique_ID", "GARDEN", "BLOCK",
+  "ROW", "COLUMN", "mblock", "Dry_mass", "Area_m2", "LMA_g_m2",
+  "gsw", "PS2", "ETR", "Fs", "Fm", "GC_U",
+  "GC_L", "PL_U", "PL_L", "SD_upper", "SD_lower", "SDR",
+  "Ocurrence_upper", "d13C", "C", "d15N", "N", "CN",
+  "P_trichocarpa_ancestry", "Genotypic_class")
+
+##need this transformations for BLUPS and plasticity LMM
+df$log_Dry_mass<-log(df$Dry_mass)
+df$log_Area_m2<-log(df$Area_m2)
+df$log_gsw<-log(df$gsw)
+df$log_Fm<-log(df$Fm)
+
+metadata<-df %>% select(TAG, P_trichocarpa_ancestry, Genotypic_class, ID) %>% 
+  distinct()
+write.csv(metadata, "Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/metadata.csv")
+```
+
+#Q2 To what extent does ancestry predict trait and trait plasticity?
+
+##2.1. Estimate the genetic values of traits per genotypes (BLUPS)
+
+###2.1.1 Estimating  traits values per garden (BLUPs)
+```{r}
+#define traits
+
+traits <- c(
+  
+  # Leaf morphology
+  "log_Dry_mass",
+  "log_Area_m2",
+  "LMA_g_m2",
+  
+  # Gas exchange
+  "log_gsw",
+  
+  # Photochemistry
+  "PS2",
+  "ETR",
+  "Fs",
+  "log_Fm",
+  
+  # Stomatal patterning
+  "PL_U",
+  "PL_L",
+  "SD_upper",
+  "SD_lower",
+  "SDR",
+  "Ocurrence_upper",
+  
+  # Isotopes and nutrient-use traits
+  "d13C",
+  "C",
+  "d15N",
+  "N",
+  "CN"
+)
+
+
+
+# Traits fitted on the log scale.
+# These will be exponentiated after predictions are obtained.
+
+log_traits <- c(
+  "log_Dry_mass",
+  "log_Area_m2",
+  "log_gsw",
+  "log_Fm"
+)
+
+
+# Binary trait.
+# This will be modeled with a binomial GLMM.
+
+binary_traits <- c(
+  "Ocurrence_upper"
+)
+
+
+
+# create empty list
+models <- list()
+genotype_garden_results <- list()
+gxe_structure_results<-list()
+
+
+
+# LOOP THROUGH TRAITS
+
+
+for (trait in traits) {
+  
+   dat_trait <- df %>%
+    filter(
+      !is.na(.data[[trait]]),
+      !is.na(GARDEN),
+      !is.na(ID),
+      !is.na(mblock)
+    ) %>%
+    mutate(
+      GARDEN = factor(GARDEN),
+      ID = factor(ID),
+      mblock = factor(mblock)
+    )
+  
+  
+  # Check binary trait
+
+  
+  if (trait %in% binary_traits) {
+    
+    cat("Binary trait values:\n")
+    
+    print(
+      table(dat_trait[[trait]])
+    )
+  }
+  
+  
+
+  #Define model formula
+
+  
+  model_formula <- as.formula(
+    paste0(
+      trait,
+      " ~ 0 + GARDEN + ",
+      "(0 + GARDEN | ID) + ",
+      "(1 | mblock)"
+    )
+  )
+  
+  #Fit model
+
+  if (trait %in% binary_traits) {
+    
+    # --------------------------------------------------------
+    # Binary trait:
+    # binomial generalized linear mixed model
+    # --------------------------------------------------------
+    
+    mod <- glmer(
+      formula = model_formula,
+      data = dat_trait,
+      family = binomial(link = "logit"),
+      control = glmerControl(
+        optimizer = "bobyqa",
+        optCtrl = list(
+          maxfun = 2e5
+        )
+      )
+    )
+    
+  } else {
+    
+
+    # Continuous traits:
+    # Gaussian linear mixed model
+
+    mod <- lmer(
+      formula = model_formula,
+      data = dat_trait,
+      REML = TRUE
+    )
+  }
+  
+  
+  #Store model
+
+  
+  models[[trait]] <- mod
+  
+  
+  
+  
+ #Extract fixed garden effects
+
+  garden_fixed <- fixef(mod)
+  
+  
+  #Extract genotype random effects
+
+  id_re <- ranef(mod)$ID
+  
+  
+  #Calculate genotype-specific garden values
+
+    genotype_garden <- id_re %>%
+    rownames_to_column("ID") %>%
+    mutate(
+      
+      Vermont =
+        GARDENVermont +
+        garden_fixed["GARDENVermont"],
+      
+      Virginia =
+        GARDENVirginia +
+        garden_fixed["GARDENVirginia"]
+    )
+  
+  
+   #Back-transform log-transformed continuous traits
+  if (trait %in% log_traits) {
+    
+    genotype_garden <- genotype_garden %>%
+      mutate(
+        
+        Vermont =
+          exp(Vermont),
+        
+        Virginia =
+          exp(Virginia)
+      )
+  }
+  
+  
+
+  #Convert binary trait from logit to probability
+
+   
+  if (trait %in% binary_traits) {
+    
+    genotype_garden <- genotype_garden %>%
+      mutate(
+        
+        Vermont =
+          plogis(Vermont),
+        
+        Virginia =
+          plogis(Virginia)
+      )
+  }
+
+  
+    
+  # Remove "log_" from output trait names
+  # The values have already been returned
+  # to their original biological scale.
+  
+  output_trait <- sub(
+    "^log_",
+    "",
+    trait
+  )
+  
+  
+
+  # Keep and rename final columns
+
+  genotype_garden <- genotype_garden %>%
+    select(
+      ID,
+      Vermont,
+      Virginia
+    ) %>%
+    rename(
+      
+      !!paste0(
+        "Vermont_",
+        output_trait
+      ) := Vermont,
+      
+      !!paste0(
+        "Virginia_",
+        output_trait
+      ) := Virginia,
+      
+    )
+  
+  
+
+  # store trait-specific results
+
+  genotype_garden_results[[trait]] <-
+    genotype_garden
+  
+  
+  
+  
+  #Extract genotype variance and cross-garden correlation
+
+
+vc <- as.data.frame(VarCorr(mod))
+
+# Genotype-level variance/covariance only
+vc_ID <- vc %>%
+  filter(grp == "ID")
+
+# Variance among genotypes in Vermont
+var_vermont <- vc_ID %>%
+  filter(
+    var1 == "GARDENVermont",
+    is.na(var2)
+  ) %>%
+  pull(vcov)
+
+# Variance among genotypes in Virginia
+var_virginia <- vc_ID %>%
+  filter(
+    var1 == "GARDENVirginia",
+    is.na(var2)
+  ) %>%
+  pull(vcov)
+
+# Covariance/correlation between genotype effects
+cross_garden <- vc_ID %>%
+  filter(!is.na(var2))
+
+cov_vermont_virginia <- cross_garden$vcov
+
+cor_vermont_virginia <- cross_garden$sdcor
+
+
+# Store results
+gxe_structure_results[[trait]] <- data.frame(
+  
+  Trait = sub("^log_", "", trait),
+  
+  Var_Vermont = var_vermont,
+  
+  Var_Virginia = var_virginia,
+  
+  Cov_Vermont_Virginia =
+    cov_vermont_virginia,
+  
+  Genotypic_correlation =
+    cor_vermont_virginia
+)
+}
+
+
+# COMBINE ALL TRAITS INTO ONE WIDE DATASET
+
+garden_blups_results <- genotype_garden_results %>%
+  reduce(
+    full_join,
+    by = "ID"
+  )
+
+
+gxe_structure_table <- bind_rows(
+  gxe_structure_results
+) %>%
+  mutate(
+  )
+
+gxe_structure_table
+
+#write.csv(  garden_blups_results,  "Q2_TraitVariation_Plasticity_Ancestry/Genotype_Garden_BLUPs.csv",row.names = FALSE)
+
+
+```
+###2.1.2 Compare genotype garden-specific blups with means
+```{r}
+# Calculate observed means per genotype × garden
+
+observed_means <- df %>%
+  select(ID, GARDEN, all_of(traits)) %>%
+  mutate(
+    across(
+      all_of(log_traits),
+      exp
+    )
+  ) %>%
+  rename_with(
+    ~ sub("^log_", "", .x),
+    all_of(log_traits)
+  ) %>%
+  group_by(ID, GARDEN) %>%
+  summarise(
+    across(
+      all_of(sub("^log_", "", traits)),
+      ~ mean(.x, na.rm = TRUE)
+    ),
+    .groups = "drop"
+  ) %>%
+  pivot_wider(
+    names_from = GARDEN,
+    values_from = all_of(sub("^log_", "", traits)),
+    names_glue = "{GARDEN}_{.value}"
+  )
+
+
+# Convert BLUPs to long format
+blups_long <- garden_blups_results %>%
+  pivot_longer(
+    cols = -ID,
+    names_to = c("Garden", "Trait"),
+    names_pattern = "^(Vermont|Virginia)_(.*)$",
+    values_to = "BLUP"
+  )
+
+# Convert observed means to long format
+means_long <- observed_means %>%
+  pivot_longer(
+    cols = -ID,
+    names_to = c("Garden", "Trait"),
+    names_pattern = "^(Vermont|Virginia)_(.*)$",
+    values_to = "Observed_mean"
+  )
+
+# Join both datasets
+comparison <- means_long %>%
+  inner_join(
+    blups_long,
+    by = c("ID", "Garden", "Trait")
+  ) %>%
+  filter(
+    !is.na(Observed_mean),
+    !is.na(BLUP),
+    is.finite(Observed_mean),
+    is.finite(BLUP)
+  )
+
+correlation_results <- comparison %>%
+  group_by(Trait, Garden) %>%
+  summarise(
+    N = n(),
+    Spearman_rho = if (
+      n() >= 3 &&
+      n_distinct(Observed_mean) > 1 &&
+      n_distinct(BLUP) > 1
+    ) {
+      cor(
+        Observed_mean,
+        BLUP,
+        method = "spearman"
+      )
+    } else {
+      NA_real_
+    },
+    .groups = "drop"
+  )
+
+print(correlation_results)
+
+write.csv(correlation_results, "Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/Correlation_BLUPS_means.csv")
+
+
+# Select only these trait × garden combinations
+selected_data <- comparison %>%
+  filter(
+    (Trait == "C" & Garden == "Virginia") |
+    (Trait == "d15N" & Garden == "Virginia") |
+    (Trait == "Fs" & Garden == "Vermont") |
+    (Trait == "ETR" & Garden == "Virginia")
+  )
+
+# Create individual plots
+trait_plots <- list()
+
+for (trait in c("C", "d15N", "Fs", "ETR")) {
+
+  dat_plot <- selected_data %>%
+    filter(Trait == trait)
+
+  p <- ggplot(
+    dat_plot,
+    aes(x = Observed_mean, y = BLUP)
+  ) +
+    geom_point(
+      alpha = 0.6,
+      size = 2,
+      color = "steelblue4"
+    ) +
+    stat_cor(
+      method = "spearman",
+      aes(label = after_stat(r.label)),
+      label.x.npc = "left",
+      label.y.npc = "top",
+      size = 4
+    ) +
+    theme_bw(base_size = 12) +
+    theme(
+      panel.grid = element_blank(),
+      plot.title = element_text(
+        size = 14,
+        face = "bold",
+        hjust = 0.5
+      )
+    ) +
+    labs(
+      title = paste(trait, unique(dat_plot$Garden), sep = " - "),
+      x = "Observed genotype mean",
+      y = "BLUP"
+    )
+
+  trait_plots[[trait]] <- p
+}
+
+# Combine into a 2 × 2 figure
+combined_plot <- wrap_plots(
+  trait_plots,
+  ncol = 2
+)
+
+# Save as a single-page PDF
+ggsave(
+  "Observed_means_vs_BLUPs_selected_traits.pdf",
+  plot = combined_plot,
+  width = 12,
+  height = 10,
+  units = "in"
+)
+```
+
+###2.1.2 Estimating Plasticity 
+####2.1.3 Plasticity index 
+
+```{r}
+  #         |Virginia - Vermont|
+  # P = -----------------------------
+  #         Virginia + Vermont
+  #
+ 
+
+traits_2 <- c(
+  
+  # Leaf morphology
+  "Dry_mass",
+  "Area_m2",
+  "LMA_g_m2",
+  
+  # Gas exchange
+  "gsw",
+  
+  # Photochemistry
+  "PS2",
+  "ETR",
+  "Fs",
+  "Fm",
+  
+  # Stomatal patterning
+  "PL_U",
+  "PL_L",
+  "SD_upper",
+  "SD_lower",
+  "SDR",
+  "Ocurrence_upper",
+  
+  # Isotopes and nutrient-use traits
+  "d13C",
+  "C",
+  "d15N",
+  "N",
+  "CN"
+)
+
+
+
+ 
+# Calculate plasticity index for each trait
+for (trait in traits_2) {
+  
+  virginia_col <- paste0("Virginia_", trait)
+  vermont_col  <- paste0("Vermont_", trait)
+  
+  plasticity_col <- paste0("Plasticity_", trait)
+  
+  garden_blups_results[[plasticity_col]] <-
+    (garden_blups_results[[virginia_col]] -
+       garden_blups_results[[vermont_col]]) /
+    (garden_blups_results[[virginia_col]] +
+       garden_blups_results[[vermont_col]])
+}
+
+df2<-merge(df,garden_blups_results, by ="ID")
+
+
+```
+
+
+### 2.2 Linear mixed models
+#### 2.2.1 Does genomic ancestry predicts traits?
+```{r}
+# Trait base names
+traits_garden <- c(
+  "Dry_mass", "Area_m2", "LMA_g_m2",
+  "gsw", "d13C",
+  "PS2", "Fm", "Fs", "ETR",
+  "PL_L", "PL_U", "SD_lower",
+  "SD_upper", "SDR", "Ocurrence_upper",
+  "N", "d15N", "CN"
+)
+
+gardens <- c("Vermont", "Virginia")
+
+trait_labels_garden <- list(
+  
+  "Dry_mass" =
+    expression("Leaf dry mass (g)"),
+  
+  "Area_m2" =
+    expression("Leaf area (" * m^2 * ")"),
+  
+  "LMA_g_m2" =
+    expression("Leaf mass per area (" * g ~ m^{-2} * ")"),
+  
+  "gsw" =
+    expression(
+      "Stomatal conductance (" *
+        mol ~ m^{-2} ~ s^{-1} * ")"
+    ),
+  
+  "d13C" =
+    expression(
+      "Water-use efficiency (" *
+        delta^{13} * C ~ "\u2030" * ")"
+    ),
+  
+  "PS2" =
+    expression("Quantum efficiency in light"),
+  
+  "ETR" =
+    expression(
+      "Electron transport rate (" *
+        mol ~ m^{-2} ~ s^{-1} * ")"
+    ),
+  
+  "Fs" =
+    expression("Minimum fluorescence in light"),
+  
+  "Fm" =
+    expression("Maximum fluorescence in light"),
+  
+  "PL_U" =
+    expression(
+      "Adaxial pore length (" *
+        mu * m * ")"
+    ),
+  
+  "PL_L" =
+    expression(
+      "Abaxial pore length (" *
+        mu * m * ")"
+    ),
+  
+  "SD_upper" =
+    expression(
+      "Adaxial stomatal density (" *
+        mm^{-2} * ")"
+    ),
+  
+  "SD_lower" =
+    expression(
+      "Abaxial stomatal density (" *
+        mm^{-2} * ")"
+    ),
+  
+  "SDR" =
+    expression("Stomatal ratio"),
+  
+  "Ocurrence_upper" =
+    expression("Adaxial stomatal occurrence"),
+  
+  "N" =
+    expression("Nitrogen content (%)"),
+  
+  "CN" =
+    expression("Carbon:Nitrogen ratio"),
+  
+  "d15N" =
+    expression(
+      "Nitrogen isotopes (" *
+        delta^{15} * N ~ "\u2030" * ")"
+    )
+)
+
+# Store plots
+plots_garden <- list(
+  Vermont = list(),
+  Virginia = list()
+)
+
+
+# Store model results
+model_results_garden <- data.frame(
+  Garden = character(),
+  Trait = character(),
+  Best_model = character(),
+  R2 = numeric(),
+  AdjR2 = numeric(),
+  AIC_linear = numeric(),
+  AIC_quadratic = numeric(),
+  Delta_AIC = numeric(),
+  Linear_Estimate = numeric(),
+  Linear_p = numeric(),
+  Quadratic_Estimate = numeric(),
+  Quadratic_p = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+# Loop through gardens
+for (garden in gardens) {
+  
+  # Loop through traits
+  for (trait in traits_garden) {
+    
+    # Create actual column name
+    trait_col <- paste0(garden, "_", trait)
+    
+    if (!trait_col %in% names(df2)) {
+      warning(paste("Trait not found:", trait_col))
+      next
+    }
+    
+    
+    # Data for this garden/trait
+    df_plot <- df2 %>%
+      dplyr::select(
+        P_trichocarpa_ancestry,
+        all_of(trait_col)
+      ) %>%
+      na.omit()
+    
+    
+    # Linear model
+    lm_lin <- lm(
+      reformulate(
+        "P_trichocarpa_ancestry",
+        response = trait_col
+      ),
+      data = df_plot
+    )
+    
+    
+    # Quadratic model
+    lm_quad <- lm(
+      as.formula(
+        paste0(
+          trait_col,
+          " ~ poly(P_trichocarpa_ancestry, 2)"
+        )
+      ),
+      data = df_plot
+    )
+    
+    
+    # Compare AIC
+    aic_lin  <- AIC(lm_lin)
+    aic_quad <- AIC(lm_quad)
+    
+    delta_aic <- aic_lin - aic_quad
+    
+    
+    # Select model
+    if (delta_aic > 2) {
+      best_model <- lm_quad
+      model_type <- "quadratic"
+    } else {
+      best_model <- lm_lin
+      model_type <- "linear"
+    }
+    
+    
+    # R2
+    sm <- summary(best_model)
+    
+    r2 <- sm$r.squared
+    adjr2 <- sm$adj.r.squared
+    
+    
+    # Linear coefficient
+    lin_coef <- summary(lm_lin)$coefficients
+    
+    lin_est <- lin_coef[2, "Estimate"]
+    lin_p   <- lin_coef[2, "Pr(>|t|)"]
+    
+    
+    # Quadratic coefficient
+    quad_coef <- summary(lm_quad)$coefficients
+    
+    quad_est <- quad_coef[3, "Estimate"]
+    quad_p   <- quad_coef[3, "Pr(>|t|)"]
+    
+    
+    # P-value corresponding to selected model
+    best_p <- if (model_type == "linear") {
+      lin_p
+    } else {
+      quad_p
+    }
+    
+    
+    # Significance stars
+    stars <- ifelse(
+      best_p < 0.001, "***",
+      ifelse(
+        best_p < 0.01, "**",
+        ifelse(best_p < 0.05, "*", "")
+      )
+    )
+    
+    
+    # Save model results
+    model_results_garden <- rbind(
+      model_results_garden,
+      data.frame(
+        Garden = garden,
+        Trait = trait,
+        Best_model = model_type,
+        R2 = r2,
+        AdjR2 = adjr2,
+        AIC_linear = aic_lin,
+        AIC_quadratic = aic_quad,
+        Delta_AIC = delta_aic,
+        Linear_Estimate = lin_est,
+        Linear_p = lin_p,
+        Quadratic_Estimate = quad_est,
+        Quadratic_p = quad_p
+      )
+    )
+    
+    
+    # Subtitle
+    subtitle_text <- paste0(
+      "R² = ",
+      sprintf("%.2f", r2),
+      stars
+    )
+    
+    
+    # Plot
+    p <- ggplot(
+      df_plot,
+      aes(
+        x = P_trichocarpa_ancestry,
+        y = .data[[trait_col]]
+      )
+    ) +
+      geom_point(
+        aes(fill = P_trichocarpa_ancestry),
+        shape = 21,
+        size = 3,
+        alpha = 0.8,
+        color = "black",
+        stroke = 0.3
+      ) +
+      scale_fill_gradient2(
+        midpoint = 0.5,
+        low = "dodgerblue2",
+        mid = "grey20",
+        high = "darkolivegreen2",
+        space = "Lab"
+      ) +
+      labs(
+        x = expression(
+          italic("P. trichocarpa") ~ "ancestry"
+        ),
+        y = trait_labels_garden[[trait]],
+        subtitle = subtitle_text
+      ) +
+      theme_bw() +
+      theme(
+        legend.position = "none",
+        axis.text.x = element_text(
+          color = "black",
+          size = 10
+        ),
+        axis.text.y = element_text(
+          color = "black",
+          size = 10
+        ),
+        axis.title.x = element_text(size = 12),
+        axis.title.y = element_text(size = 11),
+        plot.title = element_text(size = 14),
+        plot.subtitle = element_text(
+          size = 14,
+          color = "black"
+        ),
+        panel.grid = element_blank()
+      )
+    
+    
+    # Add selected model
+    if (model_type == "linear") {
+      
+      p <- p +
+        geom_smooth(
+          method = "lm",
+          formula = y ~ x,
+          se = TRUE,
+          color = "blue"
+        )
+      
+    } else {
+      
+      p <- p +
+        geom_smooth(
+          method = "lm",
+          formula = y ~ poly(x, 2),
+          se = TRUE,
+          color = "red"
+        )
+    }
+    
+    
+    # Store plot
+    plots_garden[[garden]][[trait]] <- p
+  }
+}
+
+
+# Round model results
+model_results_garden <- model_results_garden %>%
+  mutate(
+    R2 = round(R2, 2),
+    AdjR2 = round(AdjR2, 2),
+    AIC_linear = round(AIC_linear, 2),
+    AIC_quadratic = round(AIC_quadratic, 2),
+    Delta_AIC = round(Delta_AIC, 2),
+    Linear_Estimate = round(Linear_Estimate, 3),
+    Linear_p = signif(Linear_p, 3),
+    Quadratic_Estimate = round(Quadratic_Estimate, 3),
+    Quadratic_p = signif(Quadratic_p, 3)
+  )
+
+
+library(patchwork)
+
+# ------------------------------------------------------------
+# Save all Vermont plots in one PDF
+# and all Virginia plots in one PDF
+# following the order in traits_garden
+# ------------------------------------------------------------
+
+for (garden in gardens) {
+  
+  # Keep plots in exact trait order
+  plot_list <- lapply(
+    traits_garden,
+    function(trait) {
+      
+      p <- plots_garden[[garden]][[trait]]
+      
+      if (is.null(p)) {
+        return(NULL)
+      }
+      
+      # Re-assign the y-axis title explicitly
+      # so it is preserved in the combined figure
+      p +
+        labs(
+          y = trait_labels_garden[[trait]]
+        ) +
+        theme(
+          axis.title.y = element_text(
+            size = 11,
+            margin = margin(r = 8)
+          ),
+          plot.margin = margin(
+            t = 8,
+            r = 8,
+            b = 8,
+            l = 12
+          )
+        )
+    }
+  )
+  
+  
+  # Remove missing plots
+  plot_list <- plot_list[
+    !sapply(plot_list, is.null)
+  ]
+  
+  
+  # ----------------------------------------------------------
+  # Number of columns
+  # ----------------------------------------------------------
+  
+  ncol_plot <- 4
+  
+  nrow_plot <- ceiling(
+    length(plot_list) / ncol_plot
+  )
+  
+  
+  # ----------------------------------------------------------
+  # Combine with patchwork
+  # ----------------------------------------------------------
+  
+  combined_plot <- wrap_plots(
+    plot_list,
+    ncol = ncol_plot,
+    nrow = nrow_plot
+  )
+  
+  
+  # ----------------------------------------------------------
+  # Save PDF
+  # ----------------------------------------------------------
+  
+  ggsave(
+    filename = paste0(
+      "Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/Ancestry_",
+      garden,
+      "_all_traits.pdf"
+    ),
+    plot = combined_plot,
+    width = 18,
+    height = nrow_plot * 3.5,
+    units = "in",
+    device = cairo_pdf
+  )
+  
+  
+  ggsave(
+  filename = paste0(
+    "Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/Ancestry_",
+    garden,
+    "_all_traits.png"
+  ),
+  plot = combined_plot,
+  width = 12,
+  height = nrow_plot * 3.5,
+  units = "in",
+  dpi = 720
+)
+}
+
+write.csv(model_results_garden, "Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/model_results_gardens.csv")
+```
+
+
+
+
+#### 2.2.1 Does genomic ancestry predicts trait plasticty?
+
+```{r}
+
+traits_base <- c(
+  "Dry_mass",
+  "Area_m2",
+  "LMA_g_m2",
+  "gsw",
+  "d13C",
+  "PS2",
+  "Fm",
+  "Fs",
+  "ETR",
+  "PL_L",
+  "PL_U",
+  "SD_lower",
+  "SD_upper",
+  "SDR",
+  "Ocurrence_upper",
+  "N",
+  "d15N",
+  "CN"
+)
+
+
+# LABELS
+
+
+trait_labels_base <- list(
+  "Dry_mass" = "Leaf dry mass",
+  "Area_m2" = bquote("Leaf area (" * m^2 * ")"),
+  "LMA_g_m2" = bquote("Leaf mass per area (" * g ~ m^{-2} * ")"),
+  "gsw" = bquote("Stomatal conductance (" * mol ~ m^{-2} ~ s^{-1} * ")"),
+  "d13C" = bquote("Water-use efficiency (" * delta^13 * C ~ "\u2030" * ")"),
+  "PS2" = "Quantum efficiency in light",
+  "Fm" = "Maximum fluorescence in light",
+  "Fs" = "Minimum fluorescence in light",
+  "ETR" = bquote("Electron transport rate (" * mol ~ m^{-2} ~ s^{-1} * ")"),
+  "PL_L" = bquote("Abaxial pore length (" * mu * m * ")"),
+  "PL_U" = bquote("Adaxial pore length (" * mu * m * ")"),
+  "SD_lower" = bquote("Abaxial stomatal density (" * mm^{-2} * ")"),
+  "SD_upper" = bquote("Adaxial stomatal density (" * mm^{-2} * ")"),
+  "SDR" = "Stomatal ratio",
+  "Ocurrence_upper" = "Adaxial stomatal occurrence",
+  "N" = "Nitrogen content (%)",
+  "d15N" = bquote("Nitrogen isotopes (" * delta^15 * N ~ "\u2030" * ")"),
+  "CN" = "Carbon:Nitrogen ratio"
+)
+
+
+# EMPTY OBJECTS
+
+
+plots_all <- list()
+
+model_results_all <- data.frame(
+  Trait = character(),
+  Variable = character(),
+  Best_model = character(),
+  R2 = numeric(),
+  AdjR2 = numeric(),
+  AIC_linear = numeric(),
+  AIC_quadratic = numeric(),
+  Delta_AIC = numeric(),
+  Linear_Estimate = numeric(),
+  Linear_p = numeric(),
+  Quadratic_Estimate = numeric(),
+  Quadratic_p = numeric(),
+  stringsAsFactors = FALSE
+)
+
+
+# LOOP OVER TRAITS
+
+
+for (trait in traits_base) {
+  
+  variable <- paste0("Plasticity_", trait)
+  
+  if (!variable %in% names(df2)) {
+    warning(paste("Variable not found:", variable))
+    next
+  }
+  
+
+  # Prepare data
+
+  
+  df_plot <- df2 %>%
+    dplyr::select(
+      P_trichocarpa_ancestry,
+      all_of(variable)
+    ) %>%
+    na.omit()
+  
+
+  # Fit linear and quadratic models
+
+  
+  lm_lin <- lm(
+    as.formula(
+      paste(variable, "~ P_trichocarpa_ancestry")
+    ),
+    data = df_plot
+  )
+  
+  lm_quad <- lm(
+    as.formula(
+      paste(variable, "~ poly(P_trichocarpa_ancestry, 2)")
+    ),
+    data = df_plot
+  )
+  
+
+  # Compare AIC
+
+  
+  aic_lin <- AIC(lm_lin)
+  aic_quad <- AIC(lm_quad)
+  
+  delta_aic <- aic_lin - aic_quad
+  
+  if (delta_aic > 2) {
+    best_model <- lm_quad
+    model_type <- "quadratic"
+  } else {
+    best_model <- lm_lin
+    model_type <- "linear"
+  }
+  
+
+  # Model statistics
+
+  
+  sm <- summary(best_model)
+  
+  r2 <- sm$r.squared
+  adjr2 <- sm$adj.r.squared
+  
+  lin_coef <- summary(lm_lin)$coefficients
+  
+  lin_est <- lin_coef[2, "Estimate"]
+  lin_p <- lin_coef[2, "Pr(>|t|)"]
+  
+  quad_coef <- summary(lm_quad)$coefficients
+  
+  quad_est <- quad_coef[3, "Estimate"]
+  quad_p <- quad_coef[3, "Pr(>|t|)"]
+  
+  best_p <- if (model_type == "linear") {
+    lin_p
+  } else {
+    quad_p
+  }
+  
+  stars <- ifelse(
+    best_p < 0.001, "***",
+    ifelse(
+      best_p < 0.01, "**",
+      ifelse(best_p < 0.05, "*", "")
+    )
+  )
+  
+
+  # Save results
+
+  
+  model_results_all <- rbind(
+    model_results_all,
+    data.frame(
+      Trait = trait,
+      Variable = variable,
+      Best_model = model_type,
+      R2 = r2,
+      AdjR2 = adjr2,
+      AIC_linear = aic_lin,
+      AIC_quadratic = aic_quad,
+      Delta_AIC = delta_aic,
+      Linear_Estimate = lin_est,
+      Linear_p = lin_p,
+      Quadratic_Estimate = quad_est,
+      Quadratic_p = quad_p
+    )
+  )
+  
+
+  # Subtitle
+
+  
+  subtitle_text <- paste0(
+    "R² = ",
+    sprintf("%.2f", r2),
+    stars
+  )
+  
+
+  # Plot
+
+  
+  p <- ggplot(
+    df_plot,
+    aes(
+      x = P_trichocarpa_ancestry,
+      y = .data[[variable]]
+    )
+  ) +
+    
+    geom_point(
+      aes(fill = P_trichocarpa_ancestry),
+      shape = 21,
+      size = 3,
+      alpha = 0.8,
+      color = "black",
+      stroke = 0.3
+    ) +
+    
+    scale_fill_gradient2(
+      midpoint = 0.5,
+      low = "dodgerblue2",
+      mid = "grey20",
+      high = "darkolivegreen2",
+      space = "Lab"
+    ) +
+    
+    labs(
+      x = expression(
+        italic("P. trichocarpa") ~ "ancestry"
+      ),
+      y = trait_labels_base[[trait]],
+      subtitle = subtitle_text
+    ) +
+    
+    theme_bw() +
+    
+    theme(
+      legend.position = "none",
+      axis.text.x = element_text(
+        color = "black",
+        size = 10
+      ),
+      axis.text.y = element_text(
+        color = "black",
+        size = 10
+      ),
+      axis.title.x = element_text(size = 12),
+      axis.title.y = element_text(size = 11),
+      plot.subtitle = element_text(
+        size = 13,
+        color = "black"
+      ),
+      panel.grid = element_blank()
+    )
+  
+
+  # Add selected model
+
+  
+  if (model_type == "linear") {
+    
+    p <- p +
+      geom_smooth(
+        method = "lm",
+        formula = y ~ x,
+        se = TRUE,
+        color = "blue"
+      )
+    
+  } else {
+    
+    p <- p +
+      geom_smooth(
+        method = "lm",
+        formula = y ~ poly(x, 2),
+        se = TRUE,
+        color = "red"
+      )
+  }
+  
+
+  # Save plot
+
+  
+  plots_all[[trait]] <- p
+}
+
+
+# ROUND RESULTS
+
+
+model_results_all <- model_results_all %>%
+  mutate(
+    R2 = round(R2, 2),
+    AdjR2 = round(AdjR2, 2),
+    AIC_linear = round(AIC_linear, 2),
+    AIC_quadratic = round(AIC_quadratic, 2),
+    Delta_AIC = round(Delta_AIC, 2),
+    Linear_Estimate = round(Linear_Estimate, 3),
+    Linear_p = signif(Linear_p, 3),
+    Quadratic_Estimate = round(Quadratic_Estimate, 3),
+    Quadratic_p = signif(Quadratic_p, 3)
+  )
+
+
+# SAVE RESULTS
+
+
+write.csv(model_results_all,"Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/Plasticity_results.csv",row.names = FALSE)
+
+
+
+# COMBINE PLASTICITY INDEX PLOTS
+
+
+combined_plot_index <- ggarrange(
+  plotlist = plots_all,
+  ncol = 4,
+  nrow = 5,
+  common.legend = TRUE,
+  legend = "right"
+)
+
+combined_plot_index
+
+
+ggsave(
+  filename = "Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/PlasticityIndex_vs_Ancestry.png",
+  plot = combined_plot_index,
+  width = 18,
+  height = 17.5,
+  units = "in",
+  dpi = 720
+)
+
+```
+
+
+
+#Plot reaction norms per trait
+
+```{r}
+# 1. Create genotypic classes
+
+
+df2 <- df2 %>%
+  mutate(
+    Genotypic_class = case_when(
+      P_trichocarpa_ancestry <= 0.02 ~ "balsam_parental",
+      P_trichocarpa_ancestry >= 0.98 ~ "tricho_parental",
+      TRUE ~ "Hybrids"
+    )
+  )
+
+table(df2$Genotypic_class)
+
+
+
+# 2. Traits
+
+
+traits <- c(
+  "Dry_mass",
+  "Area_m2",
+  "LMA_g_m2",
+  "gsw",
+  "d13C",
+  "PS2",
+  "Fm",
+  "Fs",
+  "ETR",
+  "PL_L",
+  "PL_U",
+  "SD_lower",
+  "SD_upper",
+  "SDR",
+  "Ocurrence_upper",
+  "N",
+  "d15N",
+  "CN"
+)
+
+
+
+# 3. Y-axis labels
+
+
+trait_labels <- list(
+  
+  "Dry_mass" = "Leaf dry mass (g)",
+  
+  "Area_m2" = bquote(
+    "Leaf area (" * m^2 * ")"
+  ),
+  
+  "LMA_g_m2" = bquote(
+    "Leaf mass per area (" * g ~ m^{-2} * ")"
+  ),
+  
+  "gsw" = bquote(
+    "Stomatal conductance (" * mol ~ m^{-2} ~ s^{-1} * ")"
+  ),
+  
+  "d13C" = bquote(
+    delta^13 * C ~ ("\u2030")
+  ),
+  
+  "PS2" = expression(Phi[PSII]),
+  
+  "Fm" = expression(F[m]),
+  
+  "Fs" = expression(F[s]),
+  
+  "ETR" = "Electron transport rate",
+  
+  "PL_L" = "Pore length, lower surface",
+  
+  "PL_U" = "Pore length, upper surface",
+  
+  "SD_lower" = bquote(
+    "Stomatal density, lower (" * mm^{-2} * ")"
+  ),
+  
+  "SD_upper" = bquote(
+    "Stomatal density, upper (" * mm^{-2} * ")"
+  ),
+  
+  "SDR" = "Stomatal density ratio",
+  
+  "Ocurrence_upper" = "Adaxial stomatal occurrence",
+  
+  "N" = "Leaf nitrogen (%)",
+  
+  "d15N" = bquote(
+    delta^15 * N ~ ("\u2030")
+  ),
+  
+  "CN" = "C:N ratio"
+)
+
+
+
+# 4. Create reaction-norm plots
+
+
+reaction_norm_plots <- list()
+
+for (trait in traits) {
+  
+  vt_col <- paste0("Vermont_", trait)
+  va_col <- paste0("Virginia_", trait)
+  
+  # Skip trait if columns are missing
+  if (!all(c(vt_col, va_col) %in% names(df2))) {
+    message("Skipping ", trait, ": columns not found")
+    next
+  }
+  
+  # Reshape to long format
+  df_reaction <- df2 %>%
+    select(
+      ID,
+      Genotypic_class,
+      P_trichocarpa_ancestry,
+      all_of(c(vt_col, va_col))
+    ) %>%
+    pivot_longer(
+      cols = all_of(c(vt_col, va_col)),
+      names_to = "Garden",
+      values_to = "Trait_value"
+    ) %>%
+    mutate(
+      Garden = case_when(
+        Garden == vt_col ~ "Vermont",
+        Garden == va_col ~ "Virginia"
+      ),
+      Garden = factor(
+        Garden,
+        levels = c("Virginia", "Vermont")
+      )
+    )
+  
+  
+  # Plot
+  p <- ggplot(
+    df_reaction,
+    aes(
+      x = Garden,
+      y = Trait_value,
+      group = ID
+    )
+  ) +
+    
+    geom_line(
+      alpha = 0.5,
+      aes(color = P_trichocarpa_ancestry)
+    ) +
+    
+    geom_point(
+      aes(color = P_trichocarpa_ancestry),
+      size = 1,
+      alpha = 0.7
+    ) +
+    
+    scale_color_gradient2(
+      midpoint = 0.5,
+      low = "dodgerblue2",
+      mid = "grey20",
+      high = "darkolivegreen2",
+      space = "Lab"
+    ) +
+    
+    facet_grid(
+      ~ Genotypic_class,
+      labeller = labeller(
+        Genotypic_class = c(
+          "balsam_parental" = "italic(P.~balsamifera)",
+          "Hybrids" = "Hybrids",
+          "tricho_parental" = "italic(P.~trichocarpa)"
+        ),
+        .default = label_parsed
+      )
+    ) +
+    
+    theme_bw() +
+    
+    labs(
+      x = NULL,
+      y = trait_labels[[trait]]
+    ) +
+    
+    theme(
+      axis.text.x = element_text(
+        color = "black",
+        size = 10
+      ),
+      axis.text.y = element_text(
+        color = "black",
+        size = 10
+      ),
+      strip.background = element_rect(
+        fill = "white"
+      ),
+      strip.text = element_text(
+        colour = "black",
+        size = 12
+      ),
+      axis.title.x = element_text(
+        size = 12
+      ),
+      axis.title.y = element_text(
+        size = 11
+      ),
+      plot.title = element_text(
+        size = 14
+      ),
+      panel.grid = element_blank(),
+      legend.position = "none"
+    )
+  
+  
+  # Save plot object
+  reaction_norm_plots[[trait]] <- p
+}
+
+
+
+# Save all reaction norm plots
+# One trait per page
+
+
+ggsave(
+  filename = "Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/Reaction_norms_all_traits.pdf",
+  plot = reaction_norm_plots,
+  device = "pdf",
+  width = 10,
+  height = 4,
+  units = "in"
+)
+```
+
+
+
+#Main figure2
+
+```{r}
+library(ggpubr)
+library(ggplot2)
+library(scales)
+
+
+
+two_decimals <- scale_y_continuous(labels = label_number(accuracy = 0.01))
+
+# Themes to remove repeated elements
+remove_strip <- theme(
+  strip.text = element_blank(),
+  strip.background = element_blank()
+)
+
+remove_y <- theme(
+  axis.title.y = element_blank()
+  )
+
+font_size_y <- theme(
+  axis.title.y = element_text(color = "black", size = 13)
+  )
+
+remove_x <- theme(
+  axis.title.x = element_blank()
+  )
+
+# First column
+p1  <- plots_garden$Virginia$LMA_g_m2 + two_decimals+remove_x+font_size_y 
+p5  <- plots_garden$Virginia$gsw + two_decimals+remove_x +font_size_y
+p9  <- plots_garden$Virginia$SD_upper + two_decimals+remove_x +font_size_y
+p13 <- plots_garden$Virginia$SD_lower + two_decimals+remove_x +font_size_y
+p17 <- plots_garden$Virginia$CN + two_decimals+font_size_y
+
+#Second column
+p2  <- plots_garden$Vermont$LMA_g_m2 + two_decimals+remove_x+font_size_y+ remove_y 
+p6  <- plots_garden$Vermont$gsw + two_decimals+remove_x +font_size_y+ remove_y
+p10  <- plots_garden$Vermont$SD_upper + two_decimals+remove_x+ remove_y +font_size_y+remove_y
+p14 <- plots_garden$Vermont$SD_lower + two_decimals+remove_x+ remove_y +font_size_y+remove_y
+p18 <- plots_garden$Vermont$CN + two_decimals+font_size_y+ remove_y
+
+# Middle column
+p3  <- reaction_norm_plots$LMA_g_m2 + remove_y + two_decimals+remove_x 
+p7  <- reaction_norm_plots$gsw + remove_strip + remove_y + two_decimals+remove_x 
+p11  <- reaction_norm_plots$SD_upper + remove_strip + remove_y + two_decimals+remove_x 
+p15 <- reaction_norm_plots$SD_lower + remove_strip + remove_y + two_decimals+remove_x 
+p19 <- reaction_norm_plots$CN + remove_strip + remove_y + two_decimals
+
+# Right column
+p4  <- plots_all$Plasticity_LMA_g_m2 + remove_strip + remove_y + two_decimals+remove_x 
+p8  <- plots_all$Plasticity_gsw + remove_strip + remove_y + two_decimals+remove_x 
+p12  <- plots_all$Plasticity_SD_upper + remove_strip + remove_y + two_decimals+remove_x 
+p16 <- plots_all$Plasticity_SD_lower+ remove_strip + remove_y + two_decimals+remove_x 
+p20 <- plots_all$Plasticity_CN + remove_strip + remove_y + two_decimals
+
+# Combine all panels
+figure2 <- ggarrange(
+  p1,  p2,  p3,  p4,  
+  p5,  p6,  p7,  p8,  
+  p9,  p10, p11, p12,
+  p13, p14, p15, p16,
+  p17, p18, p19, p20,
+  ncol = 4,
+  nrow = 5,
+  widths = c(1, 1, 2, 1),
+  align = "v"
+  )
+
+figure2
+
+
+ggsave(
+  filename = "Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/figure2.pdf",
+  plot = figure2,
+  width = 15,
+  height = 16,
+  units = "in"
+)
+
+ggsave(
+  filename = "Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/figure2.png",
+  plot = figure2,
+  width = 15,
+  height = 16,
+  units = "in",
+  dpi = 720
+)
+
+```
+#Main figure3
+```{r}
+p_ocurren  <- plots_blup$BLUP_Ocurrence_upper 
+p_ocurren2  <- plots_slope$slope_Ocurrence_upper_full
+
+combined_plot_Figure2 <- ggarrange(
+  p_ocurren, p_ocurren2, 
+  ncol = 2,
+  nrow =1,
+  common.legend = TRUE, 
+  legend = "right"
+)
+
+
+
+saveRDS(combined_plot_Figure2, "Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/Figure3_blups_pasticity.rds")
+
+```
+#Supplementary figures
+
+```{r}
+plots_blup_suppl_figures <- plots_blup[
+  setdiff(
+    names(plots_blup),
+    c(
+      "BLUP_LMA_g_m2",
+      "BLUP_log_gsw",
+      "BLUP_SD_upper",
+      "BLUP_SD_lower",
+      "BLUP_CN",
+      "BLUP_Ocurrence_upper"
+    )
+  )
+]
+
+combined_plot_blup_supple <- ggarrange(
+  plotlist = plots_blup_suppl_figures,
+  ncol = 3,
+  nrow = 4,
+  common.legend = TRUE, 
+  legend = "right"
+)
+
+
+ggsave(
+  filename = "Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/FigureSX_BLUPS_vs_Ancestry.png",
+  plot = combined_plot_blup_supple,
+  width = 12,
+  height = 12,
+  units = "in",
+  dpi = 300
+)
+
+
+
+```
+
+```{r}
+plots_slope_suppl_figures <- plots_slope[
+  setdiff(
+    names(plots_slope),
+    c(
+      "slope_LMA_g_m2_full",
+      "slope_log_gsw_full",
+      "slope_SD_upper_full",
+      "slope_SD_lower_full",
+      "slope_CN_full",
+      "slope_Ocurrence_upper_full"
+    )
+  )
+]
+
+combined_plot_slope_supple <- ggarrange(
+  plotlist = plots_slope_suppl_figures,
+  ncol = 3,
+  nrow = 4,
+  common.legend = TRUE, 
+  legend = "right"
+)
+
+ggsave(
+  filename = "Scripts and Data/Q2_TraitVariation_Plasticity_Ancestry/FigureSX_SLOPE_vs_Ancestry.png",
+  plot = combined_plot_slope_supple,
+  width = 12,
+  height = 12,
+  units = "in",
+  dpi = 300
+)
+
+```
+
